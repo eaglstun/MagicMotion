@@ -17,6 +17,7 @@ import os
 import pandas as pd
 import torch
 from args import get_args
+from device_utils import get_device
 from diffusers.models import AutoencoderKLCogVideoX
 from diffusers.schedulers import CogVideoXDPMScheduler
 from diffusers.utils import export_to_video, load_image, load_video
@@ -28,15 +29,18 @@ from transformers import T5EncoderModel, T5Tokenizer
 
 def main(args):
 
+    device = get_device()
+    print(f"[ MagicMotion ] Using device: {device}")
+
     tokenizer = T5Tokenizer.from_pretrained(
         "THUDM/CogVideoX-5b-I2V", subfolder="tokenizer"
     )
     text_encoder = T5EncoderModel.from_pretrained(
         "THUDM/CogVideoX-5b-I2V", subfolder="text_encoder"
-    ).cuda()
+    ).to(device)
     vae = AutoencoderKLCogVideoX.from_pretrained(
         "THUDM/CogVideoX-5b-I2V", subfolder="vae"
-    ).cuda()
+    ).to(device)
     load_dtype = (
         torch.bfloat16
         if "5b" in args.pretrained_model_name_or_path.lower()
@@ -103,12 +107,16 @@ def main(args):
     num_frames = 49
     fps = 8
 
-    # 3. Enable CPU offload for the model.
-    # turn off if you have multiple GPUs or enough GPU memory(such as H100) and it will cost less time in inference
-    # and enable to("cuda")
-
-    # pipe.to("cuda")
-    pipe.enable_sequential_cpu_offload()
+    # 3. Device placement.
+    # On CUDA the default keeps sequential CPU offload so it fits in ~24GB. On Apple
+    # Silicon (MPS) / CPU, accelerate's sequential offload targets CUDA, so instead we
+    # move the whole pipeline onto the device (fine on unified-memory Macs). Force
+    # offload anywhere with MAGICMOTION_CPU_OFFLOAD=1.
+    force_offload = os.environ.get("MAGICMOTION_CPU_OFFLOAD") == "1"
+    if device.type == "cuda" or force_offload:
+        pipe.enable_sequential_cpu_offload(device=device)
+    else:
+        pipe.to(device)
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
 
