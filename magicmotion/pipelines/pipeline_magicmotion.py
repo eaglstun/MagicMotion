@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import inspect
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import PIL
@@ -183,7 +185,10 @@ class MagicMotionPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
     """
 
     _optional_components = []
-    model_cpu_offload_seq = "text_encoder->transformer->vae"
+    # controlnet must be in the offload chain (it runs each denoising step, feeding
+    # the transformer); the upstream CogVideoX seq omitted it. Ordered right before
+    # the transformer so module CPU-offload keeps the loop's hot models managed.
+    model_cpu_offload_seq = "text_encoder->controlnet->transformer->vae"
 
     _callback_tensor_inputs = [
         "latents",
@@ -453,6 +458,10 @@ class MagicMotionPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             latents = latents.to(device)
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
+        # Release the VAE-encode cache: MPS retains freed blocks against its watermark,
+        # so without this the next encode (trajectory maps) hits a spurious OOM.
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         return latents, image_latents
 
     def prepare_trajectory_latents(
@@ -495,6 +504,8 @@ class MagicMotionPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             ]
             trajectory_latents = torch.cat([first_frame, trajectory_latents], dim=1)
 
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         return trajectory_latents
 
     # Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline.decode_latents
@@ -1063,10 +1074,27 @@ class MagicMotionPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 ):
                     progress_bar.update()
 
+                # Reclaim per-step MPS cache: without this, freed activation blocks
+                # accumulate against the memory watermark across steps and the run is
+                # killed a few steps in on unified-memory Macs.
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+
         if not output_type == "latent":
             # Discard any padding frames that were added for CogVideoX 1.5
             latents = latents[:, additional_frames:]
             # save_tensor_as_images_with_pca(latents, "visualization/duck/output_latents")
+
+            # Insurance: persist the finished latents so a failed decode (the heaviest
+            # VAE op, which OOMs on a memory-marginal Mac) can be retried in a separate
+            # lean process without re-running the whole denoising loop.
+            _latents_path = os.environ.get("MAGICMOTION_SAVE_LATENTS")
+            if _latents_path:
+                torch.save(latents.cpu(), _latents_path)
+            gc.collect()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
             video = self.decode_latents(latents)
             video = self.video_processor.postprocess_video(
                 video=video, output_type=output_type

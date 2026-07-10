@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 import pandas as pd
 import torch
@@ -32,15 +33,25 @@ def main(args):
     device = get_device()
     print(f"[ MagicMotion ] Using device: {device}")
 
+    # Load weights directly in the target dtype. Loading fp32 and casting later
+    # strands the fp32 copies in the MPS caching allocator (~tens of GB of ghost
+    # memory) and triggers spurious out-of-memory during VAE encode.
+    compute_dtype = (
+        torch.bfloat16
+        if "5b" in args.pretrained_model_name_or_path.lower()
+        else torch.float16
+    )
+
     tokenizer = T5Tokenizer.from_pretrained(
         "THUDM/CogVideoX-5b-I2V", subfolder="tokenizer"
     )
+    # Kept on CPU here; the offload strategy below places each model on the device.
     text_encoder = T5EncoderModel.from_pretrained(
-        "THUDM/CogVideoX-5b-I2V", subfolder="text_encoder"
-    ).to(device)
+        "THUDM/CogVideoX-5b-I2V", subfolder="text_encoder", torch_dtype=compute_dtype
+    )
     vae = AutoencoderKLCogVideoX.from_pretrained(
-        "THUDM/CogVideoX-5b-I2V", subfolder="vae"
-    ).to(device)
+        "THUDM/CogVideoX-5b-I2V", subfolder="vae", torch_dtype=compute_dtype
+    )
     load_dtype = (
         torch.bfloat16
         if "5b" in args.pretrained_model_name_or_path.lower()
@@ -67,6 +78,9 @@ def main(args):
         print(
             f"[ Weights from pretrained perception_head was loaded into transformer ] [M: {len(m)} | U: {len(u)}]"
         )
+        # release the fp32 checkpoint tensors (already copied into the module)
+        del ckpt, perception_head_state_dict
+        gc.collect()
     model_config = (
         transformer.module.config
         if hasattr(transformer, "module")
@@ -91,6 +105,10 @@ def main(args):
     print(
         f"[ Weights from pretrained controlnet was loaded into controlnet ] [M: {len(m)} | U: {len(u)}]"
     )
+    # release the ~12GB fp32 checkpoint tensors (already copied into the controlnet);
+    # left dangling they force the whole run into swap on a 64GB unified-memory Mac.
+    del ckpt, controlnet_state_dict
+    gc.collect()
 
     scheduler = CogVideoXDPMScheduler.from_pretrained(
         "THUDM/CogVideoX-5b-I2V", subfolder="scheduler"
@@ -107,18 +125,36 @@ def main(args):
     num_frames = 49
     fps = 8
 
-    # 3. Device placement.
-    # On CUDA the default keeps sequential CPU offload so it fits in ~24GB. On Apple
-    # Silicon (MPS) / CPU, accelerate's sequential offload targets CUDA, so instead we
-    # move the whole pipeline onto the device (fine on unified-memory Macs). Force
-    # offload anywhere with MAGICMOTION_CPU_OFFLOAD=1.
-    force_offload = os.environ.get("MAGICMOTION_CPU_OFFLOAD") == "1"
-    if device.type == "cuda" or force_offload:
+    # 3. Device placement / memory strategy. CogVideoX-5b is fixed at 480x720x49 and
+    # is memory-marginal on a 64GB unified-memory Mac, so pick per environment:
+    #  - MAGICMOTION_NO_OFFLOAD=1: everything resident (pipe.to). Fastest, but the
+    #    VAE encode + denoising step overflow 64GB unless little else is running.
+    #  - MAGICMOTION_CPU_OFFLOAD=1 or CUDA: sequential (layer-by-layer) offload —
+    #    lowest peak, the ~24GB-VRAM path; thrashes on MPS.
+    #  - MPS / CPU default: model (module-level) offload — the reliable Mac path; the
+    #    VAE encode runs with the transformer parked, the transformer stays resident
+    #    through the loop. Slow on unified memory (offload duplicates into one RAM pool)
+    #    but it completes where the resident path OOMs.
+    if os.environ.get("MAGICMOTION_NO_OFFLOAD") == "1":
+        pipe.to(device)
+    elif device.type == "cuda" or os.environ.get("MAGICMOTION_CPU_OFFLOAD") == "1":
         pipe.enable_sequential_cpu_offload(device=device)
     else:
-        pipe.to(device)
+        pipe.enable_model_cpu_offload(device=device)
     pipe.vae.enable_slicing()
+    # Default tiles keep the 49-frame VAE encode within the resident-memory budget once
+    # the fp32 checkpoints are freed. (Don't shrink these blindly — tiles small enough to
+    # downsample below the 3x3 conv kernel crash the encoder.)
     pipe.vae.enable_tiling()
+
+    # Reclaim cached-but-freed blocks left over from loading/casting before the
+    # memory-heavy VAE encode. On MPS this is what keeps peak allocation under the
+    # unified-memory watermark; harmless elsewhere.
+    gc.collect()
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # Run inference
     if args.validation_args_csv and args.num_validation_videos > 0:
@@ -163,9 +199,13 @@ def main(args):
                 "controlnet_weights": float(weight),
             }
             print("Generating:", validation_prompt)
+            # Denoising steps: fewer = faster (and lower peak memory), at some quality
+            # cost. Override with MAGICMOTION_STEPS; default 50 matches the paper.
+            num_inference_steps = int(os.environ.get("MAGICMOTION_STEPS", 50))
             video_generate = pipe(
                 **pipeline_args,
                 num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
                 generator=torch.Generator().manual_seed(seed),
                 output_type="np",
             ).frames[0]
