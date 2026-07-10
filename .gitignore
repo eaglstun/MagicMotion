@@ -7,3 +7,4 @@ magicmotion/dataset
 magicmotion/train.py
 huggingface_download.sh
 huggingface_uplaod.py
+ckpts/
